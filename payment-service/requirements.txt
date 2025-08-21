@@ -1,0 +1,18 @@
+# Core dependencies
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.1
+
+# Database
+sqlalchemy==1.4.53
+pyodbc==5.0.1
+
+# Redis
+redis==5.0.1
+
+# Utilities
+python-dotenv==1.0.0
+python-multipart==0.0.6
+
+# For Windows SQL Server connectivity
+pyodbc==5.0.1
