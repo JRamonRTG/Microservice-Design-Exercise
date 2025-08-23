@@ -3,7 +3,7 @@ from sqlalchemy.orm import Session
 from typing import List
 
 from database import get_db
-from models import PaymentRequest, PaymentResponse, PaymentStatus, PLANS_INFO
+from models import Payment, PaymentRequest, PaymentResponse, PaymentStatus, PLANS_INFO  # Agregado Payment
 from services.payment_service import payment_service
 
 router = APIRouter()
@@ -128,5 +128,6 @@ async def get_all_payments(
     db: Session = Depends(get_db)
 ):
     """Obtener todos los pagos (para admin/debug)"""
-    payments = db.query(Payment).offset(skip).limit(limit).all()
+    # Importamos Payment de models correctamente
+    payments = payment_service.get_all_payments(db, skip, limit)  # Mejor usar el servicio
     return payments

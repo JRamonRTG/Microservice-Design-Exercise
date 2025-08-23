@@ -89,6 +89,10 @@ class PaymentService:
         """Obtener pagos de un usuario"""
         return db.query(Payment).filter(Payment.user_id == user_id).order_by(desc(Payment.created_at)).offset(skip).limit(limit).all()
     
+    def get_all_payments(self, db: Session, skip: int = 0, limit: int = 100):
+        """Obtener todos los pagos (para admin/debug)"""
+        return db.query(Payment).order_by(desc(Payment.created_at)).offset(skip).limit(limit).all()
+    
     def _simulate_payment_processing(self, payment: Payment) -> bool:
         """Simular el procesamiento del pago"""
         import random

@@ -265,9 +265,9 @@ if __name__ == "__main__":
     port = int(os.getenv("SERVICE_PORT", 8002))
     host = os.getenv("SERVICE_HOST", "0.0.0.0")
     
-    logger.info(f"🚀 Iniciando Payment Service DEV en {host}:{port}")
-    logger.info("📝 Usando almacenamiento en memoria")
-    logger.info("🌐 Endpoints disponibles:")
+    logger.info(f"Iniciando Payment Service DEV en {host}:{port}")
+    logger.info("Usando almacenamiento en memoria")
+    logger.info("Endpoints disponibles:")
     logger.info("   - http://localhost:8002/")
     logger.info("   - http://localhost:8002/health")
     logger.info("   - http://localhost:8002/api/v1/plans")
