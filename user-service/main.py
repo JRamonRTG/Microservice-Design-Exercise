@@ -1,79 +1,69 @@
 import os
-import pyodbc
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from dotenv import load_dotenv
+import pytds
 
-# Cargar variables del .env
+# Cargar variables de entorno (útil en local)
 load_dotenv()
 
-print("📂 Variables de entorno cargadas:", os.environ.keys())
-print("🔌 DATABASE_URL:", os.getenv("DATABASE_URL"))
+# Crear la aplicación FastAPI
+app = FastAPI(title="User Service", version="1.0")
 
+# ----------- Configuración de DB -----------
+DB_SERVER = os.getenv("DB_SERVER")       # ej: services2025.database.windows.net
+DB_NAME = os.getenv("DB_NAME")           # ej: services
+DB_USER = os.getenv("DB_USER")           # ej: user
+DB_PASSWORD = os.getenv("DB_PASSWORD")   # ej: Prueba2025-
 
-app = FastAPI(title="User Service")
+def get_connection():
+    return pytds.connect(
+        server=DB_SERVER,
+        database=DB_NAME,
+        user=DB_USER,
+        password=DB_PASSWORD,
+        port=1433,
+        encryption=True,
+        trust_server_certificate=False
+    )
 
-# Cadena de conexión desde .env
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# Modelo para requests
-class UserRequest(BaseModel):
+# ----------- Modelos de entrada -----------
+class UserRegister(BaseModel):
     name: str
     email: str
 
-class PlanRequest(BaseModel):
+class PlanSelection(BaseModel):
     plan_name: str
 
-# 🔹 Función auxiliar para conectarse a SQL Server
-def get_connection():
-    print("🔌 Cadena de conexión:", DATABASE_URL)
-    return pyodbc.connect(DATABASE_URL)
+# ----------- Endpoints -------------------
+@app.get("/")
+def root():
+    return {
+        "service": "User Service",
+        "status": "ok",
+        "docs": "/docs"
+    }
 
-# Crear tablas si no existen
-def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("""
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
-    CREATE TABLE users (
-        id INT IDENTITY(1,1) PRIMARY KEY,
-        name NVARCHAR(100) NOT NULL,
-        email NVARCHAR(100) UNIQUE NOT NULL
-    )
-    """)
-    cursor.execute("""
-    IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='plans' and xtype='U')
-    CREATE TABLE plans (
-        id INT IDENTITY(1,1) PRIMARY KEY,
-        user_id INT NOT NULL,
-        plan_name NVARCHAR(50) NOT NULL
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-@app.on_event("startup")
-def startup_event():
-    init_db()
-
-# 🔹 Registrar usuario
 @app.post("/users/register")
-def register_user(req: UserRequest):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (name, email) OUTPUT INSERTED.id VALUES (?, ?)", req.name, req.email)
-    user_id = cursor.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return {"id": user_id, "name": req.name, "email": req.email}
+def register_user(user: UserRegister):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO Users (name, email) VALUES (%s, %s)", (user.name, user.email))
+        conn.commit()
+        conn.close()
+        return {"message": f"Usuario {user.name} registrado con éxito."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
-# 🔹 Seleccionar plan
 @app.post("/users/{user_id}/select-plan")
-def select_plan(user_id: int, req: PlanRequest):
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO plans (user_id, plan_name) OUTPUT INSERTED.id VALUES (?, ?)", user_id, req.plan_name)
-    plan_id = cursor.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return {"id": plan_id, "user_id": user_id, "plan_name": req.plan_name}
+def select_plan(user_id: int, plan: PlanSelection):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("UPDATE Users SET plan = %s WHERE id = %s", (plan.plan_name, user_id))
+        conn.commit()
+        conn.close()
+        return {"message": f"Usuario {user_id} actualizado al plan {plan.plan_name}."}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
