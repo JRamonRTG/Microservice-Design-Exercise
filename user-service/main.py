@@ -1,33 +1,11 @@
-import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from dotenv import load_dotenv
-import pytds
+import pyodbc
+import os
 
-# Cargar variables de entorno (útil en local)
-load_dotenv()
+app = FastAPI()
 
-# Crear la aplicación FastAPI
-app = FastAPI(title="User Service", version="1.0")
-
-# ----------- Configuración de DB -----------
-DB_SERVER = os.getenv("DB_SERVER")       # ej: services2025.database.windows.net
-DB_NAME = os.getenv("DB_NAME")           # ej: services
-DB_USER = os.getenv("DB_USER")           # ej: user
-DB_PASSWORD = os.getenv("DB_PASSWORD")   # ej: Prueba2025-
-
-def get_connection():
-    return pytds.connect(
-        server=DB_SERVER,
-        database=DB_NAME,
-        user=DB_USER,
-        password=DB_PASSWORD,
-        port=1433,
-        encryption=True,
-        trust_server_certificate=False
-    )
-
-# ----------- Modelos de entrada -----------
+# Modelos para las solicitudes
 class UserRegister(BaseModel):
     name: str
     email: str
@@ -35,35 +13,52 @@ class UserRegister(BaseModel):
 class PlanSelection(BaseModel):
     plan_name: str
 
-# ----------- Endpoints -------------------
+# Obtener cadena de conexión desde variables de entorno
+def get_connection():
+    conn_str = os.getenv("DATABASE_URL")
+    if not conn_str:
+        raise Exception("DATABASE_URL no está definida en variables de entorno")
+    return pyodbc.connect(conn_str)
+
+# Endpoint raíz para pruebas
 @app.get("/")
 def root():
-    return {
-        "service": "User Service",
-        "status": "ok",
-        "docs": "/docs"
-    }
+    return {"message": "Microservicio de usuarios activo"}
 
+# Registro de usuario
 @app.post("/users/register")
 def register_user(user: UserRegister):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("INSERT INTO Users (name, email) VALUES (%s, %s)", (user.name, user.email))
+
+        cursor.execute(
+            "INSERT INTO users (name, email) VALUES (?, ?)",
+            user.name, user.email
+        )
         conn.commit()
-        conn.close()
-        return {"message": f"Usuario {user.name} registrado con éxito."}
+        return {"message": "Usuario registrado con éxito"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
 
+# Selección de plan
 @app.post("/users/{user_id}/select-plan")
 def select_plan(user_id: int, plan: PlanSelection):
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("UPDATE Users SET plan = %s WHERE id = %s", (plan.plan_name, user_id))
+
+        cursor.execute(
+            "UPDATE users SET plan = ? WHERE id = ?",
+            plan.plan_name, user_id
+        )
         conn.commit()
-        conn.close()
-        return {"message": f"Usuario {user_id} actualizado al plan {plan.plan_name}."}
+        return {"message": f"Plan '{plan.plan_name}' asignado al usuario {user_id}"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        cursor.close()
+        conn.close()
