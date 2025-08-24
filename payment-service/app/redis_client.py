@@ -43,7 +43,7 @@ class RedisEventClient:
             try:
                 await self.client.xgroup_create("fitflow:events:PlanSelected", self.consumer_group, id="0", mkstream=True)
                 logger.info(f"Consumer group '{self.consumer_group}' creado para PlanSelected")
-            except redis.RedisError as e:
+            except RedisError as e:
                 if "BUSYGROUP" in str(e):
                     logger.info(f"Consumer group '{self.consumer_group}' ya existe")
                 else:
