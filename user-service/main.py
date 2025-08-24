@@ -1,64 +1,159 @@
+import os
+import pyodbc
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-import pyodbc
-import os
+from dotenv import load_dotenv
+import redis
+import json
 
-app = FastAPI()
+# Cargar variables de entorno en local
+load_dotenv()
 
-# Modelos para las solicitudes
-class UserRegister(BaseModel):
+app = FastAPI(title="User Service")
+
+# Variables de entorno
+DATABASE_URL = os.getenv("DATABASE_URL")
+REDIS_HOST = os.getenv("REDIS_HOST")
+REDIS_PORT = os.getenv("REDIS_PORT", 6379)
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+print("📂 DATABASE_URL:", DATABASE_URL)
+print("🔁 REDIS_HOST:", REDIS_HOST)
+
+# Modelos
+class UserRequest(BaseModel):
     name: str
     email: str
 
-class PlanSelection(BaseModel):
+class PlanRequest(BaseModel):
     plan_name: str
 
-# Obtener cadena de conexión desde variables de entorno
+# Conexión a SQL Server
 def get_connection():
-    conn_str = os.getenv("DATABASE_URL")
-    if not conn_str:
-        raise Exception("DATABASE_URL no está definida en variables de entorno")
-    return pyodbc.connect(conn_str)
+    try:
+        print("📡 Intentando conexión a SQL Server...")
+        conn = pyodbc.connect(DATABASE_URL)
+        print("✅ Conexión a SQL Server exitosa")
+        return conn
+    except Exception as e:
+        print("❌ Error al conectar a SQL Server:", e)
+        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
 
-# Endpoint raíz para pruebas
-@app.get("/")
-def root():
-    return {"message": "Microservicio de usuarios activo"}
+# Conexión a Redis
+def get_redis_client():
+    try:
+        print("🔗 Conectando a Redis...")
+        r = redis.Redis(
+            host=REDIS_HOST,
+            port=int(REDIS_PORT),
+            password=REDIS_PASSWORD,
+            decode_responses=True,
+            ssl=True
+        )
+        r.ping()
+        print("✅ Conexión a Redis exitosa")
+        return r
+    except Exception as e:
+        print("❌ Redis no disponible:", e)
+        return None
 
-# Registro de usuario
+# Inicializar DB
+def init_db():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
+        CREATE TABLE users (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            name NVARCHAR(100) NOT NULL,
+            email NVARCHAR(100) UNIQUE NOT NULL
+        )
+        """)
+
+        cursor.execute("""
+        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='plans' and xtype='U')
+        CREATE TABLE plans (
+            id INT IDENTITY(1,1) PRIMARY KEY,
+            user_id INT NOT NULL,
+            plan_name NVARCHAR(50) NOT NULL
+        )
+        """)
+
+        conn.commit()
+        print("📦 Tablas verificadas/creadas")
+    except Exception as e:
+        print("❌ Error al inicializar base de datos:", e)
+    finally:
+        try: cursor.close()
+        except: pass
+        try: conn.close()
+        except: pass
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
+
+# Endpoint: registro de usuario
 @app.post("/users/register")
-def register_user(user: UserRegister):
+def register_user(req: UserRequest):
+    conn = None
+    cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-
-        cursor.execute(
-            "INSERT INTO users (name, email) VALUES (?, ?)",
-            user.name, user.email
-        )
+        cursor.execute("INSERT INTO users (name, email) OUTPUT INSERTED.id VALUES (?, ?)", req.name, req.email)
+        user_id = cursor.fetchone()[0]
         conn.commit()
-        return {"message": "Usuario registrado con éxito"}
+        print(f"✅ Usuario registrado: ID={user_id}")
+
+        # Emitir evento a Redis
+        r = get_redis_client()
+        if r:
+            r.xadd("user_events", {"data": "primero"})
+            print("📨 Evento UserRegistered enviado")
+
+        return {"id": user_id, "name": req.name, "email": req.email}
     except Exception as e:
+        print("❌ Error en /users/register:", e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            try: cursor.close()
+            except: pass
+        if conn:
+            try: conn.close()
+            except: pass
 
-# Selección de plan
+# Endpoint: selección de plan
 @app.post("/users/{user_id}/select-plan")
-def select_plan(user_id: int, plan: PlanSelection):
+def select_plan(user_id: int, req: PlanRequest):
+    conn = None
+    cursor = None
     try:
         conn = get_connection()
         cursor = conn.cursor()
-
-        cursor.execute(
-            "UPDATE users SET plan = ? WHERE id = ?",
-            plan.plan_name, user_id
-        )
+        cursor.execute("INSERT INTO plans (user_id, plan_name) OUTPUT INSERTED.id VALUES (?, ?)", user_id, req.plan_name)
+        plan_id = cursor.fetchone()[0]
         conn.commit()
-        return {"message": f"Plan '{plan.plan_name}' asignado al usuario {user_id}"}
+        print(f"✅ Plan registrado: ID={plan_id}")
+
+        # Emitir evento a Redis
+        r = get_redis_client()
+        if r:
+            event = json.dumps({"event": "PlanSelected", "plan_id": plan_id, "user_id": user_id, "plan_name": req.plan_name})
+            r.xadd("user_events", {"data": event})
+            print("📨 Evento PlanSelected enviado")
+
+        return {"id": plan_id, "user_id": user_id, "plan_name": req.plan_name}
     except Exception as e:
+        print("❌ Error en /users/{user_id}/select-plan:", e)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        cursor.close()
-        conn.close()
+        if cursor:
+            try: cursor.close()
+            except: pass
+        if conn:
+            try: conn.close()
+            except: pass
