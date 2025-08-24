@@ -1,0 +1,15 @@
+version: "3.9"
+services:
+  redis:
+    image: redis:6
+    ports:
+      - "6379:6379"
+
+  notification-service:
+    build: ../notification-service
+    ports:
+      - "8002:8000"
+    depends_on:
+      - redis
+    environment:
+      - REDIS_URL=redis://redis:6379
