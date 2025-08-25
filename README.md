@@ -1,12 +1,12 @@
 # FitFlow - Services
 
-Microservicios de usuaris, notificaciones y paymente para la plataforma de gimnasio **FitFlow**. Estos servicios son responsables de gestionar usuarios, pagos y notificaciones a los usuarios cuando ocurren eventos importantes en el sistema.
+Microservicios de usuaros, notificaciones y paymente para la plataforma de gimnasio **FitFlow**. Estos servicios son responsables de gestionar usuarios, pagos y notificaciones a los usuarios cuando ocurren eventos importantes en el sistema.
 
 ## Arquitectura del Sistema
 
 - **User Service** → Gestión de usuarios y planes
 - **Payment Service** → Procesamiento de pagos  
-- **Notification Service** → Gestión de notificaciones (este servicio)
+- **Notification Service** → Gestión de notificaciones
 
 ### Flujo de Eventos
 
@@ -312,7 +312,7 @@ curl -X GET http://localhost:8000/health
 ```bash
 json{
     "stream": "user_events",
-    "data": "primero"  // Evento básico de registro
+    "data": "primero"
 }
 ```
 
