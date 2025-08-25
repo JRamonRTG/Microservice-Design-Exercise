@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+pyodbc
+gunicorn
+python-dotenv
+redis
