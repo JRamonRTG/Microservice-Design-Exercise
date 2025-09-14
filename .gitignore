@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Entornos/secretos
+.env
+*.env
+.env.*
+*.secret
+*.key
+
+
+./notification-service/.env
+./user-service/.env
+./payment-service/.env

@@ -1,186 +1,93 @@
-import asyncio
-import logging
-import os
-from contextlib import asynccontextmanager
+
+import os, json, asyncio, logging
+import redis
 from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
 
-from database import create_database, test_connection, get_db, ensure_database_exists
-from redis_client import redis_client
-from services.payment_service import payment_service
-from routers import payment
+from app.observability import init_logging, CorrelationIdMiddleware, RequestLoggingMiddleware, set_correlation_id
+from app.database import init_db, get_session_local
+from app.routers.payment import router as payment_router
+from app.services.payment_service import payment_service
+from app.redis_client import get_client, STREAM_IN
 
-# Configurar logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+logger = init_logging(os.getenv("SERVICE_NAME","payment-service"))
+app = FastAPI(title="Payment Service")
 
-# Variable global para el task del listener
-listener_task = None
-database_available = False
+# Middlewares de observabilidad
+app.add_middleware(CorrelationIdMiddleware, header_name="x-correlation-id")
+app.add_middleware(RequestLoggingMiddleware, logger=logger)
 
-async def event_handler(event_data: dict):
-    """Manejador de eventos PlanSelected"""
+# Redis
+r = get_client()
+GROUP = os.getenv("PAYMENT_GROUP", "payment_group")
+CONSUMER = os.getenv("PAYMENT_CONSUMER", "payment_consumer_1")
+
+def ensure_group():
     try:
-        if event_data.get("event_type") == "PlanSelected" and database_available:
-            # Obtener sesión de base de datos
-            db = next(get_db())
-            try:
-                await payment_service.handle_plan_selected_event(db, event_data)
-            finally:
-                db.close()
+        if not r.exists(STREAM_IN):
+            r.xadd(STREAM_IN, {"data": "{}"})
+        r.xgroup_create(STREAM_IN, GROUP, id="$", mkstream=True)
+        logger.info("redis_group_created", extra={"extra": {"event": "redis_group_created", "stream": STREAM_IN, "group": GROUP}})
     except Exception as e:
-        logger.error(f"Error en event_handler: {e}")
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Gestión del ciclo de vida de la aplicación"""
-    global listener_task, database_available
-    
-    # Startup
-    logger.info("Iniciando Payment Service...")
-    
-    # PASO 1: Asegurar que la base de datos existe
-    logger.info("Verificando base de datos...")
-    if ensure_database_exists():
-        logger.info("Base de datos disponible")
-        
-        # PASO 2: Configurar tablas y esquema
-        logger.info("Configurando esquema de base de datos...")
-        create_database()
-        
-        # PASO 3: Probar conexión
-        if test_connection():
-            database_available = True
-            logger.info("Base de datos conectada y lista")
+        if "BUSYGROUP" in str(e):
+            logger.info("redis_group_exists", extra={"extra": {"event": "redis_group_exists", "stream": STREAM_IN, "group": GROUP}})
         else:
-            logger.warning("Problema con conexión de base de datos - continuando sin DB")
-    else:
-        logger.warning("No se pudo asegurar base de datos - continuando sin DB")
-    
-    # PASO 4: Conectar a Redis
-    logger.info("🔧 Conectando a Redis...")
-    redis_connected = await redis_client.connect()
-    if redis_connected:
-        logger.info("Redis conectado")
-        
-        # PASO 5: Iniciar listener de eventos solo si Redis funciona
-        logger.info("🔧 Iniciando listener de eventos...")
-        listener_task = asyncio.create_task(redis_client.listen_for_events(event_handler))
-        logger.info("Listener de eventos iniciado")
-    else:
-        logger.warning("Redis no disponible - continuando sin eventos")
-    
-    # PASO 6: Resumen del estado
-    if database_available and redis_connected:
-        logger.info("Payment Service iniciado completamente")
-    elif database_available:
-        logger.info("Payment Service iniciado (sin Redis)")
-    elif redis_connected:
-        logger.info("Payment Service iniciado (sin base de datos)")
-    else:
-        logger.warning("Payment Service iniciado en modo limitado (sin DB ni Redis)")
-    
-    yield
-    
-    # Shutdown
-    logger.info("Cerrando Payment Service...")
-    
-    # Detener listener
-    if listener_task:
-        await redis_client.stop_listening()
-        listener_task.cancel()
+            logger.error(f"ensure_group error: {e}", exc_info=True)
+
+async def consume_user_events():
+    ensure_group()
+    last = {STREAM_IN: ">"}
+    while True:
         try:
-            await listener_task
-        except asyncio.CancelledError:
-            pass
-    
-    # Cerrar Redis
-    if redis_connected:
-        await redis_client.close()
-    
-    logger.info("Payment Service cerrado")
+            resp = r.xreadgroup(groupname=GROUP, consumername=CONSUMER, streams=last, count=10, block=2000)
+            if not resp:
+                await asyncio.sleep(0.2)
+                continue
+            for stream, messages in resp:
+                for msg_id, fields in messages:
+                    try:
+                        raw = fields.get("data") or "{}"
+                        payload = json.loads(raw)
+                        # Establecer correlación del evento (si viene)
+                        cid = payload.get("correlation_id")
+                        set_correlation_id(cid)
 
-# Crear aplicación FastAPI
-app = FastAPI(
-    title="FitFlow Payment Service",
-    description="Microservicio de pagos para la plataforma FitFlow",
-    version="1.0.0",
-    lifespan=lifespan
-)
+                        if payload.get("event") == "PlanSelected":
+                            user_id = int(payload["user_id"])
+                            plan_id = int(payload["plan_id"])
+                            logger.info("consume_plan_selected", extra={"extra": {
+                                "event": "consume_plan_selected",
+                                "stream": stream, "msg_id": msg_id,
+                                "user_id": user_id, "plan_id": plan_id,
+                                "correlation_id": cid
+                            }})
+                            # Procesar pago
+                            session: Session = get_session_local()
+                            try:
+                                pay = payment_service.create_payment(session, user_id=user_id, plan_id=plan_id)
+                                payment_service.process_payment(session, pay)
+                            finally:
+                                session.close()
 
-# Configurar CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # En producción, especificar dominios específicos
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+                        r.xack(STREAM_IN, GROUP, msg_id)
+                    except Exception as e:
+                        logger.error(f"consume_user_events error: {e}", exc_info=True)
+        except Exception as loop_err:
+            logger.error(f"consumer_loop error: {loop_err}", exc_info=True)
+            await asyncio.sleep(1.0)
 
-# Incluir routers
-app.include_router(payment.router, prefix="/api/v1", tags=["payments"])
-
-@app.get("/")
-async def root():
-    """Endpoint raíz"""
-    return {
-        "service": "FitFlow Payment Service",
-        "version": "1.0.0",
-        "status": "running",
-        "database": "available" if database_available else "unavailable",
-        "mode": "full" if database_available else "limited"
-    }
+@app.on_event("startup")
+async def on_startup():
+    init_db()
+    asyncio.create_task(consume_user_events())
 
 @app.get("/health")
-async def health():
-    """Endpoint de salud completo"""
-    # Verificar conexión a base de datos
-    db_status = database_available and test_connection()
-    
-    # Verificar conexión a Redis
-    redis_status = True
+def health():
     try:
-        await redis_client.client.ping()
-    except:
-        redis_status = False
-    
-    # Determinar estado general
-    if db_status and redis_status:
-        overall_status = "healthy"
-    elif db_status or redis_status:
-        overall_status = "degraded"
-    else:
-        overall_status = "limited"
-    
-    return {
-        "service": "payment-service",
-        "status": overall_status,
-        "database": "connected" if db_status else "disconnected",
-        "redis": "connected" if redis_status else "disconnected",
-        "version": "1.0.0",
-        "capabilities": {
-            "payments": True,  # Siempre disponible (puede usar memoria)
-            "persistence": db_status,
-            "events": redis_status
-        }
-    }
+        r.ping()
+        return {"status": "healthy", "service": "payment-service"}
+    except Exception as e:
+        return {"status": "degraded", "error": str(e)}
 
-if __name__ == "__main__":
-    import uvicorn
-    
-    port = int(os.getenv("SERVICE_PORT", 8002))
-    host = os.getenv("SERVICE_HOST", "0.0.0.0")
-    
-    logger.info(f"Iniciando servidor en {host}:{port}")
-    logger.info("Documentación disponible en: http://localhost:8002/docs")
-    
-    uvicorn.run(
-        "main:app",
-        host=host,
-        port=port,
-        reload=False,
-        log_level="info"
-    )
+# API
+app.include_router(payment_router)

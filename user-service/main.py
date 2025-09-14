@@ -1,159 +1,185 @@
 import os
+import json
 import pyodbc
-from fastapi import FastAPI, HTTPException
+import redis
+from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel
 from dotenv import load_dotenv
-import redis
-import json
 
-# Cargar variables de entorno en local
+from observability import (
+    init_logging, CorrelationIdMiddleware, RequestLoggingMiddleware,
+    get_correlation_id
+)
+
 load_dotenv()
+
+logger = init_logging("user-service")
 
 app = FastAPI(title="User Service")
 
-# Variables de entorno
-DATABASE_URL = os.getenv("DATABASE_URL")
-REDIS_HOST = os.getenv("REDIS_HOST")
-REDIS_PORT = os.getenv("REDIS_PORT", 6379)
-REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+# Env
+DATABASE_URL = os.getenv("DATABASE_URL")  # ODBC connection string
+REDIS_HOST = os.getenv("REDIS_HOST", "redis")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD") or None
+REDIS_SSL = os.getenv("REDIS_SSL", "false").lower() == "true"
 
-print("📂 DATABASE_URL:", DATABASE_URL)
-print("🔁 REDIS_HOST:", REDIS_HOST)
+# Middlewares (correlación + request logs)
+app.add_middleware(CorrelationIdMiddleware, header_name="x-correlation-id")
+app.add_middleware(RequestLoggingMiddleware, logger=logger)
 
-# Modelos
-class UserRequest(BaseModel):
-    name: str
-    email: str
+# Redis (lazy)
+_r = None
+def r():
+    global _r
+    if _r is None:
+        _r = redis.Redis(
+            host=REDIS_HOST, port=REDIS_PORT,
+            password=REDIS_PASSWORD, ssl=REDIS_SSL,
+            decode_responses=True
+        )
+    return _r
 
-class PlanRequest(BaseModel):
-    plan_name: str
-
-# Conexión a SQL Server
+# DB helpers
 def get_connection():
-    try:
-        print("📡 Intentando conexión a SQL Server...")
-        conn = pyodbc.connect(DATABASE_URL)
-        print("✅ Conexión a SQL Server exitosa")
-        return conn
-    except Exception as e:
-        print("❌ Error al conectar a SQL Server:", e)
-        raise HTTPException(status_code=500, detail=f"DB Error: {e}")
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL no configurado")
+    return pyodbc.connect(DATABASE_URL)
 
-# Conexión a Redis
-def get_redis_client():
-    try:
-        print("🔗 Conectando a Redis...")
-        r = redis.Redis(
-            host=REDIS_HOST,
-            port=int(REDIS_PORT),
-            password=REDIS_PASSWORD,
-            decode_responses=True,
-            ssl=True
-        )
-        r.ping()
-        print("✅ Conexión a Redis exitosa")
-        return r
-    except Exception as e:
-        print("❌ Redis no disponible:", e)
-        return None
-
-# Inicializar DB
 def init_db():
-    try:
-        conn = get_connection()
-        cursor = conn.cursor()
-
-        cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='users' and xtype='U')
-        CREATE TABLE users (
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        IF OBJECT_ID('dbo.users','U') IS NULL
+        CREATE TABLE dbo.users(
             id INT IDENTITY(1,1) PRIMARY KEY,
-            name NVARCHAR(100) NOT NULL,
-            email NVARCHAR(100) UNIQUE NOT NULL
-        )
-        """)
-
-        cursor.execute("""
-        IF NOT EXISTS (SELECT * FROM sysobjects WHERE name='plans' and xtype='U')
-        CREATE TABLE plans (
+            name NVARCHAR(200) NOT NULL,
+            email NVARCHAR(200) NOT NULL UNIQUE,
+            password NVARCHAR(200) NOT NULL
+        );
+    """)
+    conn.commit()
+    cur.execute("""
+        IF OBJECT_ID('dbo.plans','U') IS NULL
+        CREATE TABLE dbo.plans(
             id INT IDENTITY(1,1) PRIMARY KEY,
             user_id INT NOT NULL,
-            plan_name NVARCHAR(50) NOT NULL
-        )
-        """)
-
-        conn.commit()
-        print("📦 Tablas verificadas/creadas")
-    except Exception as e:
-        print("❌ Error al inicializar base de datos:", e)
-    finally:
-        try: cursor.close()
-        except: pass
-        try: conn.close()
-        except: pass
+            plan_id INT NOT NULL,
+            plan_name NVARCHAR(100) NOT NULL,
+            created_at DATETIME2 DEFAULT SYSUTCDATETIME(),
+            CONSTRAINT FK_plans_users FOREIGN KEY (user_id) REFERENCES dbo.users(id)
+        );
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+    logger.info("DB initialized")
 
 @app.on_event("startup")
-def startup_event():
-    init_db()
+def on_startup():
+    try:
+        init_db()
+    except Exception as e:
+        logger.error(f"init_db error: {e}", exc_info=True)
 
-# Endpoint: registro de usuario
+# Schemas
+class RegisterReq(BaseModel):
+    name: str
+    email: str
+    password: str
+
+class PlanReq(BaseModel):
+    plan_id: int
+    plan_name: str | None = None
+
+PLANS_INFO = {1: "Plan Básico", 2: "Plan Estándar", 3: "Plan Premium"}
+
+def publish_user_event(event: dict):
+    cid = get_correlation_id()  # del middleware/ctx
+    payload = {**event, "correlation_id": cid}
+    r().xadd("user_events", {"data": json.dumps(payload)})
+    logger.info(
+        "Published to user_events",
+        extra={"extra": {"event": "publish", "stream": "user_events", "payload": payload}},
+    )
+
 @app.post("/users/register")
-def register_user(req: UserRequest):
+def register_user(req: RegisterReq, request: Request):
     conn = None
-    cursor = None
+    cur = None
     try:
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO users (name, email) OUTPUT INSERTED.id VALUES (?, ?)", req.name, req.email)
-        user_id = cursor.fetchone()[0]
-        conn.commit()
-        print(f"✅ Usuario registrado: ID={user_id}")
-
-        # Emitir evento a Redis
-        r = get_redis_client()
-        if r:
-            r.xadd("user_events", {"data": "primero"})
-            print("📨 Evento UserRegistered enviado")
-
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "INSERT INTO dbo.users (name, email, password) OUTPUT INSERTED.id VALUES (?, ?, ?)",
+                (req.name, req.email, req.password)
+            )
+            user_id = cur.fetchone()[0]
+            conn.commit()
+        except pyodbc.IntegrityError:
+            cur.execute("SELECT id FROM dbo.users WHERE email = ?", (req.email,))
+            row = cur.fetchone()
+            if not row:
+                raise
+            user_id = row[0]
+        logger.info(
+            "User registered",
+            extra={"extra": {"event": "UserRegistered", "user_id": user_id, "email": req.email}},
+        )
+        # Evento opcional de "UserRegistered"
+        publish_user_event({"event": "UserRegistered", "user_id": user_id})
         return {"id": user_id, "name": req.name, "email": req.email}
     except Exception as e:
-        print("❌ Error en /users/register:", e)
+        logger.error(f"/users/register error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if cursor:
-            try: cursor.close()
-            except: pass
-        if conn:
-            try: conn.close()
-            except: pass
+        try:
+            cur and cur.close()
+            conn and conn.close()
+        except Exception:
+            pass
 
-# Endpoint: selección de plan
 @app.post("/users/{user_id}/select-plan")
-def select_plan(user_id: int, req: PlanRequest):
+def select_plan(user_id: int, req: PlanReq, request: Request):
     conn = None
-    cursor = None
+    cur = None
     try:
+        plan_name = req.plan_name or PLANS_INFO.get(req.plan_id, "Desconocido")
         conn = get_connection()
-        cursor = conn.cursor()
-        cursor.execute("INSERT INTO plans (user_id, plan_name) OUTPUT INSERTED.id VALUES (?, ?)", user_id, req.plan_name)
-        plan_id = cursor.fetchone()[0]
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO dbo.plans (user_id, plan_id, plan_name) VALUES (?, ?, ?)",
+            (user_id, req.plan_id, plan_name)
+        )
         conn.commit()
-        print(f"✅ Plan registrado: ID={plan_id}")
-
-        # Emitir evento a Redis
-        r = get_redis_client()
-        if r:
-            event = json.dumps({"event": "PlanSelected", "plan_id": plan_id, "user_id": user_id, "plan_name": req.plan_name})
-            r.xadd("user_events", {"data": event})
-            print("📨 Evento PlanSelected enviado")
-
-        return {"id": plan_id, "user_id": user_id, "plan_name": req.plan_name}
+        logger.info(
+            "Plan selected",
+            extra={"extra": {"event": "PlanSelected", "user_id": user_id, "plan_id": req.plan_id, "plan_name": plan_name}},
+        )
+        # Evento para Payment
+        publish_user_event({
+            "event": "PlanSelected",
+            "user_id": user_id,
+            "plan_id": req.plan_id,
+            "plan_name": plan_name
+        })
+        return {"ok": True, "user_id": user_id, "plan_id": req.plan_id, "plan_name": plan_name}
     except Exception as e:
-        print("❌ Error en /users/{user_id}/select-plan:", e)
+        logger.error(f"/users/{user_id}/select-plan error: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=str(e))
     finally:
-        if cursor:
-            try: cursor.close()
-            except: pass
-        if conn:
-            try: conn.close()
-            except: pass
+        try:
+            cur and cur.close()
+            conn and conn.close()
+        except Exception:
+            pass
+
+@app.get("/health")
+def health():
+    try:
+        conn = get_connection(); conn.close()
+        r().ping()
+        return {"status": "healthy", "service": "user-service"}
+    except Exception as e:
+        return {"status": "degraded", "error": str(e)}

@@ -1,0 +1,115 @@
+version: "3.9"
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: fitflow-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  sqlserver:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: fitflow-sqlserver
+    environment:
+      - ACCEPT_EULA=Y
+      - SA_PASSWORD=YourStrong!Passw0rd
+    ports:
+      - "1433:1433"
+
+  postgres-user:
+    image: postgres:16-alpine
+    container_name: fitflow-postgres-user
+    environment:
+      POSTGRES_DB: user_db
+      POSTGRES_USER: user_svc
+      POSTGRES_PASSWORD: user123
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata_user:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  postgres-payment:
+    image: postgres:16-alpine
+    container_name: fitflow-postgres-payment
+    environment:
+      POSTGRES_DB: fitflow_payments
+      POSTGRES_USER: fitflow
+      POSTGRES_PASSWORD: fitflow123
+    ports:
+      - "5434:5432"
+    volumes:
+      - pgdata_payment:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  postgres-notification:
+    image: postgres:16-alpine
+    container_name: fitflow-postgres-notification
+    environment:
+      POSTGRES_DB: notifications_db
+      POSTGRES_USER: notif_svc
+      POSTGRES_PASSWORD: notif123
+    ports:
+      - "5435:5432"
+    volumes:
+      - pgdata_notification:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  user-service:
+    build: ../user-service
+    container_name: fitflow-user-service
+    env_file:
+      - ./env/user-service.env
+    depends_on:
+      sqlserver:
+        condition: service_started
+      redis:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+
+  payment-service:
+    build: ../payment-service
+    container_name: fitflow-payment-service
+    env_file:
+      - ./env/payment-service.env
+    depends_on:
+      postgres-payment:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    ports:
+      - "8002:8002"
+
+  notification-service:
+    build: ../notification-service
+    container_name: fitflow-notification-service
+    env_file:
+      - ./env/notification-service.env
+    depends_on:
+      redis:
+        condition: service_healthy
+    ports:
+      - "8003:8003" 
+
+volumes:
+  pgdata_user:
+  pgdata_payment:
+  pgdata_notification:

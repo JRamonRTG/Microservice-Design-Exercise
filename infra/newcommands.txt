@@ -1,0 +1,124 @@
+Estructura del repo:
+
+/infra
+/user-service
+/payment-service
+/notification-service
+
+Los .env ya deben estar en infra/env/… y el compose debe mapear:
+
+user-service → 8001:8000 (SQL Server)
+
+payment-service → 8002:8002 (PostgreSQL)
+
+notification-service → 8003:8000 (Redis)
+
+1) Levantar la infraestructura base
+cd infra
+docker compose up -d redis sqlserver postgres-payment
+
+Esperar ~25s a que SQL Server inicie.
+
+2) Crear la base user_db (SQL Server) cmd
+docker run --rm --network infra_default mcr.microsoft.com/mssql-tools ^
+  /opt/mssql-tools/bin/sqlcmd -S tcp:fitflow-sqlserver,1433 -U sa -P "YourStrong!Passw0rd" ^
+  -Q "IF DB_ID('user_db') IS NULL CREATE DATABASE user_db;"
+
+
+(Si tu red no es infra_default, cambia ese nombre por el que veas en docker network ls.)
+
+
+3) Alinear la tabla plans (solo si viene de una versión vieja) ALTERNATIVA, NO USAR LA PRIMERA VEZ
+Opción rápida: ALTER (añade plan_id si no existe)
+docker run --rm --network infra_default mcr.microsoft.com/mssql-tools ^
+  /opt/mssql-tools/bin/sqlcmd -S tcp:fitflow-sqlserver,1433 -U sa -P "YourStrong!Passw0rd" -d user_db ^
+  -Q "IF COL_LENGTH('dbo.plans','plan_id') IS NULL BEGIN ALTER TABLE dbo.plans ADD plan_id INT NOT NULL CONSTRAINT DF_plans_plan_id DEFAULT(0); END"
+
+Opción limpia: DROP/CREATE (deja que el servicio la recree)
+docker run --rm --network infra_default mcr.microsoft.com/mssql-tools ^
+  /opt/mssql-tools/bin/sqlcmd -S tcp:fitflow-sqlserver,1433 -U sa -P "YourStrong!Passw0rd" -d user_db ^
+  -Q "IF OBJECT_ID('dbo.plans','U') IS NOT NULL DROP TABLE dbo.plans;"
+
+
+Si hiciste DROP, reinicia user-service (paso 5) para que la cree en el startup.
+
+
+4) Variables de entorno (recordatorio rápido)
+
+infra/env/user-service.env
+
+SERVICE_PORT=8000
+SERVICE_HOST=0.0.0.0
+DATABASE_URL=DRIVER={ODBC Driver 18 for SQL Server};SERVER=fitflow-sqlserver,1433;DATABASE=user_db;UID=sa;PWD=YourStrong!Passw0rd;Encrypt=yes;TrustServerCertificate=yes;Connection Timeout=30;
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=
+
+
+infra/env/payment-service.env (Postgres interno postgres-payment)
+
+infra/env/notification-service.env
+
+SERVICE_PORT=8000
+SERVICE_HOST=0.0.0.0
+REDIS_HOST=redis
+REDIS_PORT=6379
+REDIS_PASSWORD=
+REDIS_SSL=false
+
+5) Levantar los 3 servicios
+cd infra
+docker compose up --build -d user-service payment-service notification-service
+docker compose ps
+
+6) Health checks
+curl http://localhost:8001/health
+curl http://localhost:8002/health
+curl http://localhost:8003/health
+
+
+Esperado:
+
+user-service → {"status":"healthy","service":"user-service"}
+
+payment-service → {"status":"healthy","service":"payment-service"}
+
+notification-service → {"status":"healthy","service":"notification-service"}
+
+
+7) Flujo E2E (CMD)
+
+Asegúrate de que payment-service está corriendo ANTES del paso 7.2 (para que lea el evento nuevo).
+
+:: 7.1 Registrar usuario (si el correo ya existe, devuelve su id)
+curl -X POST http://localhost:8001/users/register -H "Content-Type: application/json" -d "{\"name\":\"Beto\",\"email\":\"beto@example.com\",\"password\":\"secret\"}"
+
+:: Del JSON toma el "id" (usa 1 si ese fue el retorno)
+
+:: 7.2 Seleccionar plan (ahora plan_name es opcional)
+curl -X POST http://localhost:8001/users/1/select-plan -H "Content-Type: application/json" -d "{\"plan_id\":2}"
+
+:: 7.3 Ver pagos procesados (Payment escuchó PlanSelected y emitió PaymentProcessed)
+curl "http://localhost:8002/payments?user_id=1"
+
+:: 7.4 Ver notificaciones (Notification escuchó PaymentProcessed)
+curl "http://localhost:8003/notifications"
+
+
+Si hiciste 7.2 antes de que payment estuviera listo, repite 7.2 para enviar un nuevo evento.
+
+8) Verificaciones rápidas (si no ves pagos/notificaciones)
+
+:: Logs
+docker logs -f fitflow-user-service
+docker logs -f fitflow-payment-service
+docker logs -f fitflow-notification-service
+
+:: Streams en Redis
+docker exec fitflow-redis redis-cli XRANGE user_events - + COUNT 10
+docker exec fitflow-redis redis-cli XRANGE payment_events - + COUNT 10
+
+:: Tabla de pagos en Postgres (opcional)
+docker exec -it fitflow-postgres-payment psql -U fitflow -d fitflow_payments -c "SELECT id,user_id,plan_id,plan_name,amount,status,transaction_id,created_at FROM payments ORDER BY id DESC LIMIT 5;"
+
+

@@ -1,133 +1,48 @@
-from fastapi import APIRouter, Depends, HTTPException, status
+
+from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from typing import List
+from pydantic import BaseModel
+import logging
 
-from database import get_db
-from models import Payment, PaymentRequest, PaymentResponse, PaymentStatus, PLANS_INFO  # Agregado Payment
-from services.payment_service import payment_service
+from app.database import get_db
+from app.services.payment_service import payment_service
+from app.models import PaymentResponse, PLANS_INFO
+from app.observability import get_correlation_id
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
-@router.get("/health")
-async def health_check():
-    """Endpoint de salud del servicio"""
-    return {"status": "healthy", "service": "payment-service"}
-
-@router.get("/plans")
-async def get_available_plans():
-    """Obtener planes disponibles"""
-    return {"plans": PLANS_INFO}
+class PaymentReq(BaseModel):
+    plan_id: int
 
 @router.post("/payments/{user_id}", response_model=PaymentResponse)
-async def create_payment(
-    user_id: int,
-    payment_request: PaymentRequest,
-    db: Session = Depends(get_db)
-):
-    """Crear un nuevo pago para un usuario"""
+def create_and_process_payment(user_id: int, req: PaymentReq, request: Request, db: Session = Depends(get_db)):
+    cid = get_correlation_id()  # del middleware
     try:
-        # Validar que el usuario existe (en un escenario real, consultaríamos el User Service)
-        if user_id <= 0:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="ID de usuario inválido"
-            )
-        
-        # Validar que el plan existe
-        if payment_request.plan_id not in PLANS_INFO:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Plan {payment_request.plan_id} no encontrado"
-            )
-        
-        # Crear el pago
-        payment = payment_service.create_payment(db, user_id, payment_request)
-        return payment
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {str(e)}"
-        )
+        plan = PLANS_INFO.get(req.plan_id)
+        if not plan:
+            raise HTTPException(status_code=400, detail="Plan inválido")
 
-@router.post("/payments/{payment_id}/process", response_model=PaymentStatus)
-async def process_payment(
-    payment_id: int,
-    db: Session = Depends(get_db)
-):
-    """Procesar un pago pendiente"""
+        pay = payment_service.create_payment(db, user_id=user_id, plan_id=req.plan_id)
+        pay = payment_service.process_payment(db, pay)
+
+        logger.info("api_payment_completed", extra={"extra": {
+            "event": "api_payment_completed",
+            "user_id": user_id, "payment_id": pay.id,
+            "correlation_id": cid
+        }})
+        return PaymentResponse.model_validate(pay, from_attributes=True)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"create_and_process_payment error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/payments", response_model=list[PaymentResponse])
+def list_by_user(user_id: int, skip: int = 0, limit: int = 100, db: Session = Depends(get_db)):
     try:
-        payment = payment_service.process_payment(db, payment_id)
-        
-        if not payment:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Pago {payment_id} no encontrado"
-            )
-        
-        return PaymentStatus(
-            payment_id=payment.id,
-            status=payment.status,
-            transaction_id=payment.transaction_id,
-            processed_at=payment.processed_at
-        )
-        
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(e)
-        )
+        items = payment_service.get_payments_by_user(db, user_id=user_id, skip=skip, limit=limit)
+        return [PaymentResponse.model_validate(p, from_attributes=True) for p in items]
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error interno del servidor: {str(e)}"
-        )
-
-@router.get("/payments/{payment_id}", response_model=PaymentResponse)
-async def get_payment(
-    payment_id: int,
-    db: Session = Depends(get_db)
-):
-    """Obtener información de un pago específico"""
-    payment = payment_service.get_payment(db, payment_id)
-    
-    if not payment:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Pago {payment_id} no encontrado"
-        )
-    
-    return payment
-
-@router.get("/users/{user_id}/payments", response_model=List[PaymentResponse])
-async def get_user_payments(
-    user_id: int,
-    skip: int = 0,
-    limit: int = 10,
-    db: Session = Depends(get_db)
-):
-    """Obtener todos los pagos de un usuario"""
-    if user_id <= 0:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="ID de usuario inválido"
-        )
-    
-    payments = payment_service.get_payments_by_user(db, user_id, skip, limit)
-    return payments
-
-@router.get("/payments", response_model=List[PaymentResponse])
-async def get_all_payments(
-    skip: int = 0,
-    limit: int = 100,
-    db: Session = Depends(get_db)
-):
-    """Obtener todos los pagos (para admin/debug)"""
-    # Importamos Payment de models correctamente
-    payments = payment_service.get_all_payments(db, skip, limit)  # Mejor usar el servicio
-    return payments
+        logger.error(f"list_by_user error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
