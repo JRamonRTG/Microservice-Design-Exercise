@@ -1,3 +1,41 @@
+# FitFlow - Services
+
+Microservicios de usuaros, notificaciones y paymente para la plataforma de gimnasio **FitFlow**. Estos servicios son responsables de gestionar usuarios, pagos y notificaciones a los usuarios cuando ocurren eventos importantes en el sistema.
+
+## Arquitectura del Sistema
+
+- **User Service** → Gestión de usuarios y planes
+- **Payment Service** → Procesamiento de pagos  
+- **Notification Service** → Gestión de notificaciones
+
+### Flujo de Eventos
+
+```mermaid
+graph LR
+    A[User Service] -->|UserRegistered| C[Notification Service]
+    B[Payment Service] -->|PaymentProcessed| C[Notification Service]
+    C -->|Almacena| D[Notificaciones]
+```
+
+## Stack Tecnológico
+
+- **Lenguaje**: Python 3
+- **Framework**: FastAPI + Uvicorn
+- **Base de Datos**: SQL Server y PostgreSQL (Azure Database for SQL Server y postgre)
+- **Mensajería**: Redis Streams (Azure Cache for Redis)
+- **Driver BD**: Microsoft ODBC Driver 18 for SQL Server
+- **Contenedores**: Docker & Docker Compose
+- **Despliegue**: Azure Container Apps
+
+
+## Configuración y Instalación
+
+### Prerrequisitos
+
+- Python 3+
+- Docker & Docker Compose
+- Redis (local o Azure Cache for Redis)
+
 ## Observabilidad
 
 **Objetivo:** que cualquiera pueda seguir una flujo o un evento de punta a punta sin perderse, entendiendo qué pasó, dónde y con qué usuario.
