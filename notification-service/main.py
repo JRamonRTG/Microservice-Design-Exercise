@@ -1,149 +1,190 @@
 import os
 import json
-import asyncio
+import threading
+import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import List, Dict, Any
+from typing import Optional, Dict, Any
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import redis
-import httpx
 
-# Usa tu módulo de observabilidad actual (ASGI o BaseHTTP)
-# from observability import init_logging, CorrelationIdMiddleware, RequestLoggingMiddleware, set_correlation_id
+# Observabilidad
 from observability_asgi import (
-    init_logging, CorrelationIdASGIMiddleware, RequestLoggingASGIMiddleware, set_correlation_id
+    init_logging,
+    CorrelationIdASGIMiddleware,
+    RequestLoggingASGIMiddleware,
 )
 
+# Redis sync centralizado + stream
 from redis_client import get_client, STREAM_IN
-from models import Notification
+
+# Resiliencia (métricas/snapshot)
 from resilience import get_snapshot, record_consume_success, record_consume_failure
 
-logger = init_logging(os.getenv("SERVICE_NAME", "notification-service"))
-app = FastAPI(title="Notification Service")
-
-# Middlewares
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-app.add_middleware(RequestLoggingASGIMiddleware, logger=logger)
-app.add_middleware(CorrelationIdASGIMiddleware, header_name="x-correlation-id")
-
-# Redis
-r = get_client()
-GROUP = os.getenv("NOTIF_GROUP", "notification_group")
-CONSUMER = os.getenv("NOTIF_CONSUMER", "notification_consumer_1")
-
-# URL del payment-service para /diag (timeout corto)
+SERVICE_NAME = os.getenv("SERVICE_NAME", "notification-service")
 PAYMENT_HEALTH_URL = os.getenv("PAYMENT_HEALTH_URL", "http://payment-service:8002/health")
-PAYMENT_HTTP_TIMEOUT = float(os.getenv("PAYMENT_HTTP_TIMEOUT", "2"))  # segundos
 
-notifications: List[Dict[str, Any]] = []
+# ---- Estado compartido en memoria ----
+NOTIFICATIONS: deque = deque(maxlen=1000)
 
-def ensure_group():
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+def _ensure_group(r, stream: str, group: str):
     try:
-        if not r.exists(STREAM_IN):
-            r.xadd(STREAM_IN, {"data": "{}"})
-        r.xgroup_create(STREAM_IN, GROUP, id="$", mkstream=True)
-        logger.info("redis_group_created", extra={"extra": {"event": "redis_group_created", "stream": STREAM_IN, "group": GROUP}})
-    except Exception as e:
-        if "BUSYGROUP" in str(e):
-            logger.info("redis_group_exists", extra={"extra": {"event": "redis_group_exists", "stream": STREAM_IN, "group": GROUP}})
-        else:
-            logger.error(f"ensure_group error: {e}", exc_info=True)
+        r.xgroup_create(name=stream, groupname=group, id="$", mkstream=True)
+    except Exception:
+        # Grupo ya existe
+        pass
 
-async def consume():
-    ensure_group()
-    last = {STREAM_IN: ">"}
+def _parse_fields(fields: Dict[str, Any]) -> Dict[str, Any]:
+    # Mensajes vienen como: {'data': '<json string>'}
+    payload: Dict[str, Any] = {}
+    data = fields.get("data")
+    if isinstance(data, str):
+        try:
+            payload = json.loads(data)
+        except Exception:
+            payload = {"raw": data}
+    # Conserva otros campos flat si existieran
+    for k, v in fields.items():
+        payload.setdefault(k, v)
+    return payload
+
+def _consumer_loop():
+    r = get_client()
+    stream = STREAM_IN
+    group = os.getenv("NOTIF_GROUP", "notification_group")
+    consumer_name = os.getenv("NOTIF_CONSUMER", f"notif-{os.getpid()}")
+
+    _ensure_group(r, stream, group)
+
     while True:
         try:
-            resp = r.xreadgroup(groupname=GROUP, consumername=CONSUMER,
-                                streams=last, count=10, block=2000)
+            # Espera hasta 2000ms por mensajes nuevos
+            resp = r.xreadgroup(
+                groupname=group,
+                consumername=consumer_name,
+                streams={stream: '>'},
+                count=32,
+                block=2000
+            )
             if not resp:
-                await asyncio.sleep(0.2)
                 continue
 
-            for stream, messages in resp:
-                for msg_id, fields in messages:
+            for _, entries in resp:
+                for msg_id, fields in entries:
                     try:
-                        raw = fields.get("data") or "{}"
-                        payload = json.loads(raw)
-                        cid = payload.get("correlation_id")
-                        set_correlation_id(cid)
+                        payload = _parse_fields(fields)
 
-                        if payload.get("event") == "PaymentProcessed" or (
-                            "payment_id" in payload and "user_id" in payload and payload.get("status") == "completed"
-                        ):
-                            # ... guardar notificación ...
-                            record_consume_success(cid)
+                        # Ignorar vacíos
+                        if not payload or payload == {}:
+                            r.xack(stream, group, msg_id)
+                            continue
 
-                        r.xack(STREAM_IN, GROUP, msg_id)
-                    except Exception as e:
-                        record_consume_failure(e, cid if 'cid' in locals() else None)
-                        logger.error(f"consume error: {e}", exc_info=True)
+                        # Solo procesamos PaymentProcessed
+                        if payload.get("event") != "PaymentProcessed":
+                            r.xack(stream, group, msg_id)
+                            continue
 
-        except redis.exceptions.TimeoutError:
-            #  Poll idle: NO lo cuentes como fallo
-            await asyncio.sleep(0.2)
-            continue
+                        user_id = int(payload.get("user_id", 0))
+                        status  = str(payload.get("status", "unknown"))
+                        amount  = float(payload.get("amount", 0.0))
+                        txid    = payload.get("transaction_id")
+                        ts      = payload.get("created_at") or payload.get("timestamp") or _now_iso()
+                        corr    = payload.get("correlation_id")
 
-        except (redis.exceptions.ConnectionError) as loop_err:
-            #  esto sí es fallo real de dependencia
-            record_consume_failure(loop_err, None)
-            logger.warning(f"consumer_loop redis error: {loop_err}")
-            await asyncio.sleep(1.0)
+                        notif = {
+                            "id": f"{int(time.time()*1000)}-{msg_id}",
+                            "user_id": user_id,
+                            "message": f"Pago {status} por {amount:.2f}",
+                            "status": status,
+                            "amount": amount,
+                            "transaction_id": txid,
+                            "created_at": ts,
+                            "correlation_id": corr,
+                            "payment_id": payload.get("payment_id"),
+                        }
 
-        except Exception as loop_err:
-            logger.error(f"consumer_loop error: {loop_err}", exc_info=True)
-            await asyncio.sleep(1.0)
+                        # Guardar en la misma estructura que lee el endpoint
+                        NOTIFICATIONS.appendleft(notif)
+
+                        # ACK solo después de agregar
+                        r.xack(stream, group, msg_id)
+                        record_consume_success(corr)
+
+                    except Exception as inner:
+                        # No ACK -> reintento posterior si fue fallo crítico
+                        record_consume_failure(inner, payload.get("correlation_id") if 'payload' in locals() else None)
+
+        except Exception as outer:
+            record_consume_failure(outer)
+            time.sleep(0.5)  # pequeño backoff ante errores de Redis
+
+# ---- FastAPI app ----
+app = FastAPI(title=SERVICE_NAME, version="1.0.0")
+
+# Inicializa logger y pásalo al middleware que lo requiere
+logger = init_logging(service_name=SERVICE_NAME)
+
+# Middlewares de observabilidad
+app.add_middleware(CorrelationIdASGIMiddleware, header_name="x-correlation-id")
+app.add_middleware(RequestLoggingASGIMiddleware, logger=logger)
+
+# CORS para pruebas
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Arranque del consumer en background (thread, por cliente Redis sync)
+_consumer_thread: Optional[threading.Thread] = None
 
 @app.on_event("startup")
-async def on_startup():
-    asyncio.create_task(consume())
+def on_startup():
+    global _consumer_thread
+    if _consumer_thread is None or not _consumer_thread.is_alive():
+        _consumer_thread = threading.Thread(target=_consumer_loop, name="notif-consumer", daemon=True)
+        _consumer_thread.start()
 
+# Endpoints
 @app.get("/notifications")
-def get_notifications():
-    return notifications
-
-@app.get("/health")
-def health():
-    try:
-        r.ping()  # usa los timeouts configurados en el cliente
-        return {"status": "healthy", "service": "notification-service"}
-    except Exception as e:
-        return {"status": "degraded", "error": str(e)}
+def list_notifications():
+    return list(NOTIFICATIONS)
 
 @app.get("/resilience")
 def resilience_snapshot():
-    """Tablero in-memory con contadores y últimos eventos del consumer."""
     return {
-        "service": "notification-service",
+        "service": SERVICE_NAME,
         "redis_stream_in": STREAM_IN,
         "snapshot": get_snapshot(),
     }
 
 @app.get("/diag")
-async def diag():
-    """Chequea Redis y Payment con timeouts cortos; devuelve snapshot."""
-    redis_ok, payment_ok = True, True
-    redis_err, payment_err = None, None
-
-    # Redis: simple ping (ya con timeouts del cliente)
+def diag():
+    r = get_client()
+    redis_ok, redis_err = True, None
     try:
         r.ping()
     except Exception as e:
         redis_ok, redis_err = False, str(e)
 
-    # Payment-service: health HTTP con timeout 2s
+    payment_ok, payment_err = True, None
     try:
-        async with httpx.AsyncClient(timeout=PAYMENT_HTTP_TIMEOUT) as client:
-            resp = await client.get(PAYMENT_HEALTH_URL)
+        import httpx
+        with httpx.Client(timeout=2.0) as client:
+            resp = client.get(PAYMENT_HEALTH_URL)
             payment_ok = resp.status_code == 200
             if not payment_ok:
-                payment_err = f"status={resp.status_code}, body={resp.text[:200]}"
+                payment_err = f"status={resp.status_code}"
     except Exception as e:
         payment_ok, payment_err = False, str(e)
 
     return {
-        "service": "notification-service",
+        "service": SERVICE_NAME,
         "dependencies": {
             "redis_ok": redis_ok, "redis_error": redis_err,
             "payment_ok": payment_ok, "payment_error": payment_err,
@@ -152,6 +193,10 @@ async def diag():
         "snapshot": get_snapshot(),
     }
 
+@app.get("/health")
+def health():
+    return {"status": "healthy", "service": SERVICE_NAME}
+
 @app.get("/live")
 def live():
-    return {"ok": True, "service": "notification-service"}
+    return {"ok": True, "service": SERVICE_NAME}

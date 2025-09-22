@@ -1,439 +1,148 @@
-# FitFlow - Services
+## Observabilidad
 
-Microservicios de usuaros, notificaciones y paymente para la plataforma de gimnasio **FitFlow**. Estos servicios son responsables de gestionar usuarios, pagos y notificaciones a los usuarios cuando ocurren eventos importantes en el sistema.
+**Objetivo:** que cualquiera pueda seguir una flujo o un evento de punta a punta sin perderse, entendiendo qué pasó, dónde y con qué usuario.
 
-## Arquitectura del Sistema
+**Qué implementamos y por qué:**
 
-- **User Service** → Gestión de usuarios y planes
-- **Payment Service** → Procesamiento de pagos  
-- **Notification Service** → Gestión de notificaciones
+- **Correlation ID en todo el flujo**: cada flujo o evento se pasa con un `x-correlation-id`. Si no viene el middleware lo genera. Esto permite reconstruir el historial completo cuando `user-service` publica un evento que procesa `payment-service` y luego termina como notificación en `notification-service`. El beneficio es diagnóstico rápido sin buscar “a mano” entre miles de logs.
+- **Logs JSON estructurados**: todos los servicios escriben logs con un mismo formato: tiempo, nombre del servicio, nivel, tipo de evento, correlation id, duración estimada y, si el token venía en la flujo, el `auth_user_id`. Elegimos JSON porque facilita filtros.
+- **Validación JWT para trazas**: sólo `user-service` emite tokens. En `payment` y `notification` se validan para el `auth_user_id` en los logs. No bloqueamos tráfico por falta de token en esta etapa para no complicar demos ni tests; el objetivo aquí es **visibilidad**.
+- **Puntos de diagnóstico ligeros**: cada servicio expone endpoints de salud y un resumen de contadores internos (por ejemplo cuántos eventos se publicaron o consumieron y cuántos fallaron). Esto nos da cómo va el sistema sin abrir el código ni montar dashboards pesados.
 
-### Flujo de Eventos
+## Resiliencia & Registry
 
-```mermaid
-graph LR
-    A[User Service] -->|UserRegistered| C[Notification Service]
-    B[Payment Service] -->|PaymentProcessed| C[Notification Service]
-    C -->|Almacena| D[Notificaciones]
-```
+**Objetivo:** que el sistema se mantenga estable frente a fallos temporales (latencias, microcortes, picos) y que los servicios se encuentren.
 
-## Stack Tecnológico
+**Qué implementamos y por qué:**
 
-- **Lenguaje**: Python 3
-- **Framework**: FastAPI + Uvicorn
-- **Base de Datos**: SQL Server (Azure Database for SQL Server)
-- **Mensajería**: Redis Streams (Azure Cache for Redis)
-- **ORM**: SQLAlchemy 1.4.53
-- **Driver BD**: Microsoft ODBC Driver 18 for SQL Server
-- **Contenedores**: Docker & Docker Compose
-- **Despliegue**: Azure Container Apps
+- **Timeouts cortos en dependencias**: todo lo que habla con algo externo (Azure SQL, Azure PostgreSQL, Redis) tiene tiempos de espera reducidos. Es preferible fallar rápido y registrar el motivo a colgar el servicio. Esto evita cascadas de errores y nos permite decidir si reintentamos.
+- **Reintentos con backoff controlado**: al publicar o consumir eventos usamos reintentos suaves. La idea es superar microcortes sin saturar el sistema ni duplicar efectos. Están acotados para evitar loops infinitos.
+- **Backpressure e idempotencia en consumo**: consumimos en lotes pequeños y asumimos que un mensaje puede llegar dos veces. Por eso el diseño considera reconocer correctamente los mensajes y, si vemos el mismo `transaction_id`, evitar reprocesar. Esto protege de pagos duplicados y de “efectos secundarios” repetidos.
+- **Health/Readiness**: cada servicio declara si está vivo y si sus dependencias responden, lo que ayuda tanto en local como en ambientes de nube a decidir cuándo recibir tráfico.
+- **Service discovery**: en local, Docker Compose nos da DNS de servicios; en Azure Container Apps el enrutamiento lo maneja el ambiente. No se usan IPs hardcodeadas y se documentan nombres/hosts para que movernos de local a nube sea natural.
 
+## Seguridad
 
-## Configuración y Instalación
+**Objetivo:** proteger datos y credenciales sin frenar la velocidad del equipo, dejando espacio para endurecer políticas cuando el proyecto avance.
 
-### Prerrequisitos
+**Qué implementamos y por qué:**
 
-- Python 3+
-- Docker & Docker Compose
-- Redis (local o Azure Cache for Redis)
-
-### Variables de Entorno
-
-```bash
-# Redis Configuration
-REDIS_URL=redis://localhost:6379
-
-# Base de datos SQL Server
-DATABASE_URL=Driver={ODBC Driver 18 for SQL Server};Server=tcp:services2025.database.windows.net,1433;Database=services;Uid=user;Pwd=Prueba2025-;Encrypt=yes;TrustServerCertificate=no;Connection Timeout=30;
-
-# User Service Configuration  
-USER_SERVICE_URL=https://user-service.mangorock-bc5d8fa9.eastus.azurecontainerapps.io
-
-# DB para payment service
-DB_PORT=1433
-DB_NAME=fitflow_payments
-DB_USER=sa
-DB_PASSWORD=FitFlow123!
-```
-
-### Instalación Local
-
-1. **Clonar el repositorio:**
-
-2. **Instalar dependencias:**
-```bash
-pip install -r requirements.txt
-```
-3. **Configurar variables de entorno:**
-```bash
-# Crear archivo .env con las variables necesarias
-```
-
-4. **Ejecutar con Docker Compose:**
-```bash
-docker-compose up -d
-```
-
-5. **Verificar servicios:**
-```bash
-curl http://localhost:8002/notifications
-```
-
-## Ejecución
-
-### Para todos los servicios, la ejecucion debe ser python main.py respectivamente
-
-### Desarrollo Local
-
-```bash
-# Instalar dependencias
-pip install -r requirements.txt
-
-# Ejecutar el servidor
-uvicorn main:app --reload --port 8000
-```
-
-### Con Docker
-
-```bash
-
-# Construir imagen para user service(incluye ODBC Driver)
-docker build -t user-service .
-
-# Construir imagen
-docker build -t notification-service .
-
-
-# Ejecutar contenedor para user service
-docker run -p 8000:8000 \
-  -e DATABASE_URL="connection_string" \
-  -e REDIS_HOST="redis_host" \
-  user-service
-
-# Ejecutar contenedor
-docker run -p 8000:80 notification-service
+- **JWT centralizado en `user-service`**: sólo este servicio emite el token. Los demás pueden leerlo para los logs (y más adelante si queremos exigirlo). Con esto mantenemos una única fuente de verdad para la autenticación y evitamos definir firmas distintas por servicio.
+- **Principio de menor privilegio en bases de datos**: cada servicio usa credenciales y alcances propios para no tener todos permisos, a demas de que estan en diferentes bases de datos.
+  - `user-service` → Azure SQL (base `user_db`) con un usuario contenido que sólo puede leer/escribir lo suyo.
+  - `payment-service` → Azure PostgreSQL (base `fitflow_payments`) con un rol propio y un esquema dedicado (`payments`) del que es propietario.
+  - `notification-service` → por ahora no persiste en DB; si en el futuro lo hace, tendrá su propia base/rol con permisos mínimos.
+  Esta separación reduce el impacto de un posible incidente: un servicio comprometido no puede tocar datos ajenos.
+- **Gestión de secretos real**: credenciales y llaves se cargan por variables de entorno/secretos del runtime (por ejemplo, Azure Container Apps o Key Vault). Esto para rotar secretos sin recompilar ni exponerlos en el repo.
+- **Cifrado en tránsito por defecto**: Redis con TLS, SQL Server con cifrado habilitado y PostgreSQL con SSL requerido. En nube, muchas rutas salen del contenedor, así que asumimos que **todo viaje cifrado** desde el inicio.
 
 
 
-```
+# FitFlow – (3 microservicios)
 
-### Con Docker Compose
+Estructura :
+/user-service
+/payment-service
+/notification-service
+/infra (donde se maneja la infraestructura)
 
-```bash
-# Levantar servicios 
-docker-compose up -d
+para en dado caso de Docker, se usa el siguiente flujo:
 
-# Ver logs
-docker-compose logs notification-service
+# levantar dbs
+docker compose up -d redis sqlserver postgres-payment
 
-# Detener servicios
-docker-compose down
-```
+# crear db
+docker run --rm --network infra_default mcr.microsoft.com/mssql-tools ^
+  /opt/mssql-tools/bin/sqlcmd -S tcp:fitflow-sqlserver,1433 -U sa -P "YourStrong!Passw0rd" ^
+  -Q "IF DB_ID('user_db') IS NULL CREATE DATABASE user_db;"
 
-##  API Endpoints
+# levantar servicios
+docker compose up --build -d user-service payment-service notification-service
 
-### Health Check
+# Salud
+User:         http://localhost:8001/health
+Payment:      http://localhost:8002/health
+Notification: http://localhost:8003/health
 
-```http
-GET /health
-```
+# 1) Registrar usuario y logearse
+curl -X POST http://localhost:8001/users/register ^
+  -H "Content-Type: application/json" ^
+  -d "{\"name\":\"Beto\",\"email\":\"beto+e2e@example.com\",\"password\":\"secret\"}"
 
-**Respuesta:**
-```json
+curl -X POST http://localhost:8001/login ^
+  -H "Content-Type: application/json" ^
+  -d "{\"email\":\"beto+e2e@example.com\",\"password\":\"secret\"}"
+
+# 2) Seleccionar plan (debe publicar PlanSelected a Redis)
+curl -H "Authorization: Bearer %TOKEN%" ^
+     -H "x-correlation-id: demo-001" ^
+     -H "Content-Type: application/json" ^
+     -X POST http://localhost:8001/users/1/select-plan ^
+     -d "{\"plan_id\":2,\"plan_name\":\"Plan Estándar\"}"
+
+# 3) Ver pagos
+curl "http://localhost:8002/payments?user_id=1"
+
+# 4) Ver notificaciones
+curl "http://localhost:8003/notifications"
+
+
+# logs y comandos asociados
+docker logs --tail 100 fitflow-user-service
+docker logs --tail 100 fitflow-notification-service
+
+# observabilidad
+docker logs -f fitflow-user-service | findstr /i "demo-001"
+docker logs -f fitflow-notification-service | findstr /i "demo-001"
+
+# comandos de resiliencia y diagnostico por microservicio
+curl http://localhost:8001/resilience
+curl http://localhost:8002/resilience
+curl http://localhost:8003/resilience
+
+curl http://localhost:8001/diag
+curl http://localhost:8002/diag
+curl http://localhost:8003/diag
+
+## entonces, para los eventos tendriamos esquemas como estos:
+PlanSelected (user → payment)
+
 {
-  "status": "healthy",
-  "service": "notification-service"
-}
-```
-
-
-### Registrar usuario
-
-```
-POST /users/register
-```
-
-**Request:**
-```json
-{
-    "name": "Juan Pérez",
-    "email": "juan@email.com"
-}
-```
-**Respuesta:**
-```json
-{
-    "id": 1,
-    "name": "Juan Pérez",
-    "email": "juan@email.com"
-}
-```
-
-
-### Seleccionar plan
-
-```
-POST /users/{user_id}/select-plan
-```
-
-**Request:**
-```json
-{
-    "plan_name": "Plan Premium"
-}
-```
-**Respuesta:**
-```json
-{
-    "id": 1,
-    "user_id": 1,
-    "plan_name": "Plan Premium"
-}
-```
-
-
-### Obtener Notificaciones
-
-```http
-GET /notifications
-```
-
-**Respuesta:**
-```json
-[
-  {
-    "user_id": 1,
-    "message": "Usuario - registrado con -"
-  }
-]
-```
-
-### planes disponibles
-```http
-GET /api/v1/plans
-```
-**Respuesta:**
-```json
-{
-  "plans": {
-    "1": {"name": "Plan Básico", "price": 29.99},
-    "2": {"name": "Plan Estándar", "price": 49.99},
-    "3": {"name": "Plan Premium", "price": 79.99}
-  }
-}
-```
-
-### crear pago
-```http
-POST /api/v1/payments/{user_id}
-```
-**Request:**
-```json
-{
-  "plan_id": 1,
-  "payment_method": "credit_card",
-  "card_number": "4111111111111111",
-  "card_holder": "Juan Pérez",
-  "expiry_date": "12/25",
-  "cvv": "123"
-}
-```
-
-**Response:**
-```json
-{
-  "id": 1,
+  "event": "PlanSelected",
   "user_id": 1,
-  "plan_id": 1,
-  "plan_name": "Plan Básico",
-  "amount": 29.99,
-  "currency": "USD",
-  "status": "pending",
-  "payment_method": "credit_card",
-  "transaction_id": null,
-  "created_at": "2024-01-15T10:30:00",
-  "processed_at": null
+  "plan_id": 2,
+  "plan_name": "Plan Estándar",
+  "correlation_id": "demo-001",
+  "timestamp": "2025-09-22T03:49:13Z"
 }
-```
 
-### Procesar pago
-```http
-POST /api/v1/payments/{payment_id}/process
-```
-**Respuesta:**
-```json
+
+PaymentProcessed (payment → notification)
 {
-  "payment_id": 1,
+  "event": "PaymentProcessed",
+  "payment_id": 25,
+  "user_id": 1,
+  "plan_id": 2,
+  "plan_name": "Plan Estándar",
   "status": "completed",
-  "transaction_id": "txn_abc123def456",
-  "processed_at": "2024-01-15T10:31:00"
+  "amount": 49.99,
+  "transaction_id": "abcd1234",
+  "correlation_id": "demo-001",
+  "timestamp": "2025-09-22T03:50:32Z"
 }
-```
-### Obtener pago
-```http
-GET /api/v1/payments/{payment_id}
-```
-### pagos por usuario
-```http
-GET /api/v1/users/{user_id}/payments?skip=0&limit=10
-```
+
+# Endpoints 
+
+| Servicio     | Método | Ruta                            | Descripción                               |
+| ------------ | ------ | ------------------------------- | ----------------------------------------- |
+| user         | POST   | `/users/register`               | Crea usuario (SQL Server).                |
+| user         | POST   | `/login`                        | Emite JWT.                                |
+| user         | POST   | `/users/{id}/select-plan`       | Inserta selección + emite `PlanSelected`. |
+| payment      | POST   | `/payments/{user_id}`           | (testing) Crea pago + `PaymentProcessed`. |
+| payment      | GET    | `/payments?user_id=`            | Lista pagos (Postgres).                   |
+| notification | GET    | `/notifications`                | Lista notificaciones in-memory.           |
+| todos        | GET    | `/health` `/diag` `/resilience` | Salud, dependencias y métricas.           |
 
 
-
-## Pruebas
-
-### Comandos cURL
-
-```bash
-
-# Registrar usuario
-curl -X POST http://localhost:8000/users/register \
-  -H "Content-Type: application/json" \
-  -d '{"name": "Juan Pérez", "email": "juan@email.com"}'
-
-# Seleccionar plan
-curl -X POST http://localhost:8000/users/1/select-plan \
-  -H "Content-Type: application/json" \
-  -d '{"plan_name": "Plan Premium"}'
-
-
-# Obtener todas las notificaciones
-curl -X GET http://localhost:8000/notifications
-
-# Health check
-curl -X GET http://localhost:8000/health
-```
-
-
-
-## Sistema de Eventos
-
-### UserRegistered Event:
-```bash
-json{
-    "stream": "user_events",
-    "data": "primero"
-}
-```
-
-### PlanSelected Event:
-```bash
-{
-    "stream": "user_events", 
-    "data": {
-        "event": "PlanSelected",
-        "plan_id": 1,
-        "user_id": 1,
-        "plan_name": "Plan Premium"
-    }
-}
-```
-
-### Escucha PlanSelected (del user service):
-```bash
-{
-  "event_type": "PlanSelected",
-  "user_id": 1,
-  "plan_id": 1,
-  "plan_name": "Plan Básico",
-  "plan_price": 29.99,
-  "timestamp": "2024-01-15T10:30:00Z"
-}
-```
-### Emite PaymentProcessed  (al notification service):
-```bash
-{
-  "event_type": "PaymentProcessed",
-  "payment_id": 1,
-  "user_id": 1,
-  "plan_id": 1,
-  "plan_name": "Plan Básico",
-  "amount": 29.99,
-  "status": "completed",
-  "transaction_id": "txn_abc123def456",
-  "timestamp": "2024-01-15T10:31:00Z"
-}
-```
-
-
-
-## Base de datos de user
-
-
-```bash
-CREATE TABLE users (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    name NVARCHAR(100) NOT NULL,
-    email NVARCHAR(100) UNIQUE NOT NULL
-)
-
-CREATE TABLE plans (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    user_id INT NOT NULL,
-    plan_name NVARCHAR(50) NOT NULL
-)
-```
-
-## Base de datos de paymente
-
-```bash
-CREATE TABLE payments (
-    id INT IDENTITY(1,1) PRIMARY KEY,
-    user_id INT NOT NULL,
-    plan_id INT NOT NULL,
-    plan_name NVARCHAR(100) NOT NULL,
-    amount FLOAT NOT NULL,
-    currency NVARCHAR(10) DEFAULT 'USD',
-    status NVARCHAR(20) DEFAULT 'pending',  -- pending, completed, failed
-    payment_method NVARCHAR(50) DEFAULT 'credit_card',
-    transaction_id NVARCHAR(100) UNIQUE,
-    created_at DATETIME DEFAULT GETDATE(),
-    updated_at DATETIME DEFAULT GETDATE(),
-    processed_at DATETIME NULL
-)
-```
-## Estructura User Service
-
-```bash
-user-service/
-├── main.py                 #  principal 
-├── requirements.txt        # Dependencias Python
-├── Dockerfile              # Imagen del contenedor (con ODBC Driver)
-└── .env                    # Variables de entorno
-```
-
-## Estructura Payment Service
-
-```bash
-payment-service/
-├── app/
-│   ├── __init__.py             # Init
-│   ├── main.py                 # principal 
-│   ├── database.py             # Configuracion SQLAlchemy + SQL Server
-│   ├── models.py               # Modelos SQLAlchemy ( en pruebas )
-│   ├── redis_client.py         # Cliente Redis Streams
-│   ├── routers/
-│   │   ├── __init__.py
-│   │   └── payment.py              # Endpoints REST API
-│   └── services/
-│       ├── __init__.py
-│       ├── payment_service.py      # Logica de negocio
-│       └── docker-compose.yml      # Docker compose
-├── .env                        # Variables de entorno
-├── Dockerfile                  # Imagen del contenedor (con ODBC)
-└──  requirements.txt           # Dependencias Python
-```
-
-## Estructura Notification Service
-
-```bash
-notification-service/
-├── infraestructura/
-│   ├── docker-compose.yml      # Docker compose       
-├── schemas.py            # Esquemas de respuesta
-├── requirements.txt      # Dependencias Python
-├── Dockerfile            # Imagen del contenedor
-├── models.py             # Modelos de datos Pydantic
-└── main.py               # Principal
-```
-
+repositorio de github:
+https://github.com/JRamonRTG/Microservice-Design-Exercise.git
